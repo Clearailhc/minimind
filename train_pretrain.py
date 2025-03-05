@@ -28,42 +28,81 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    """
+    计算学习率，实现余弦退火学习率调度
+    
+    参数:
+        current_step: 当前训练步数
+        total_steps: 总训练步数
+        lr: 初始学习率
+    
+    返回:
+        调整后的学习率
+    """
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
 def train_epoch(epoch, wandb):
+    """
+    训练一个完整的epoch
+    
+    参数:
+        epoch: 当前epoch索引
+        wandb: Weights & Biases记录器实例
+    """
+    # 定义交叉熵损失函数，reduction='none'使得可以对每个token单独计算损失
     loss_fct = nn.CrossEntropyLoss(reduction='none')
-    start_time = time.time()
+    start_time = time.time()  # 记录开始时间，用于计算训练速度
+    
+    # 遍历数据加载器中的每个批次
     for step, (X, Y, loss_mask) in enumerate(train_loader):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
-
+        # 将数据移至指定设备(GPU/CPU)
+        X = X.to(args.device)  # 输入序列
+        Y = Y.to(args.device)  # 目标序列
+        loss_mask = loss_mask.to(args.device)  # 损失掩码，用于忽略padding位置
+        
+        # 根据当前步骤计算学习率（余弦退火调度）
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        # 更新优化器中的学习率
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
+        
+        # 使用自动混合精度上下文进行前向传播和损失计算
         with ctx:
+            # 前向传播
             res = model(X)
+            # 计算交叉熵损失
             loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),
-                Y.view(-1)
-            ).view(Y.size())
+                res.logits.view(-1, res.logits.size(-1)),  # 将logits展平为(batch_size*seq_len, vocab_size)
+                Y.view(-1)  # 将目标展平为(batch_size*seq_len)
+            ).view(Y.size())  # 重塑回原始形状
+            
+            # 应用损失掩码并归一化
             loss = (loss * loss_mask).sum() / loss_mask.sum()
+            # 添加辅助损失（如MoE的负载均衡损失）
             loss += res.aux_loss
+            # 梯度累积：将损失除以累积步数
             loss = loss / args.accumulation_steps
-
+        
+        # 反向传播（使用梯度缩放器以防止FP16下溢）
         scaler.scale(loss).backward()
-
+        
+        # 梯度累积完成后更新参数
         if (step + 1) % args.accumulation_steps == 0:
+            # 取消梯度缩放以便进行梯度裁剪
             scaler.unscale_(optimizer)
+            # 梯度裁剪，防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
+            
+            # 使用缩放器更新参数
             scaler.step(optimizer)
+            # 更新缩放因子
             scaler.update()
-
+            
+            # 清空梯度
             optimizer.zero_grad(set_to_none=True)
-
+        
+        # 定期打印训练信息
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
             Logger(
@@ -72,27 +111,32 @@ def train_epoch(epoch, wandb):
                     args.epochs,
                     step,
                     iter_per_epoch,
-                    loss.item() * args.accumulation_steps,
+                    loss.item() * args.accumulation_steps,  # 还原实际损失值（乘以累积步数）
                     optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
-
+                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))  # 估计剩余时间
+            
+            # 记录到wandb（如果启用）
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
-
+        
+        # 定期保存模型检查点
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            model.eval()
+            model.eval()  # 切换到评估模式
+            # 根据模型配置生成检查点文件名
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/pretrain_{lm_config.dim}{moe_path}.pth'
-
+            
+            # 获取模型状态字典（处理DDP模型的情况）
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
-
+            
+            # 保存模型权重
             torch.save(state_dict, ckp)
-            model.train()
+            model.train()  # 切换回训练模式
 
 
 def init_model(lm_config):
@@ -134,9 +178,9 @@ if __name__ == "__main__":
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument('--local_rank', type=int, default=-1)
-    parser.add_argument('--dim', default=512, type=int)
+    parser.add_argument('--dim', default=768, type=int)
     parser.add_argument('--n_layers', default=8, type=int)
-    parser.add_argument('--max_seq_len', default=512, type=int)
+    parser.add_argument('--max_seq_len', default=1024, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
     args = parser.parse_args()
@@ -153,8 +197,8 @@ if __name__ == "__main__":
 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
 
-    ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-    ddp_local_rank, DEVICE = 0, "cuda:0"
+    ddp = int(os.environ.get("RANK", -1)) != -1  # 检查是否为分布式训练
+    ddp_local_rank, DEVICE = 0, "cuda:0"  # 默认设备和本地排名
 
     if ddp:
         init_distributed_mode()
@@ -162,7 +206,6 @@ if __name__ == "__main__":
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
-
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
