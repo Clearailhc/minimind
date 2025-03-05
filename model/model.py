@@ -669,7 +669,7 @@ class MiniMindLM(PreTrainedModel):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = True,
+                use_cache: bool = False,
                 **args):
         """
         模型前向传播
