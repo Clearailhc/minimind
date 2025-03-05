@@ -51,14 +51,24 @@ def train_epoch(epoch, wandb):
         wandb: Weights & Biases记录器实例
     """
     # 定义交叉熵损失函数，reduction='none'使得可以对每个token单独计算损失
+    # 如果不设置reduction='none'，默认会使用'mean'，直接对所有token的损失取平均
+    # 这里使用'none'是因为我们需要应用loss_mask来选择性地计算某些token的损失
+    # 计算步骤：
+    # 1. 使用reduction='none'计算每个token的损失值
+    # 2. 将损失与loss_mask相乘，只保留需要计算损失的token（通常是模型需要预测的部分）
+    # 3. 对有效token的损失求和，再除以有效token的数量，得到平均损失
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()  # 记录开始时间，用于计算训练速度
     
     # 遍历数据加载器中的每个批次
     for step, (X, Y, loss_mask) in enumerate(train_loader):
         # 将数据移至指定设备(GPU/CPU)
+        # X和Y的shape是一致的，因为我们使用的是自回归语言模型训练方式
+        # X是输入序列(从0到n-1)，Y是目标序列(从1到n)
+        # 例如，对于序列[A,B,C,D]：X=[A,B,C]，Y=[B,C,D]
+        # 模型根据当前token预测下一个token，所以输入和目标长度相同但错开一位
         X = X.to(args.device)  # 输入序列
-        Y = Y.to(args.device)  # 目标序列
+        Y = Y.to(args.device)  # 目标序列(与输入错开一位的下一个token)
         loss_mask = loss_mask.to(args.device)  # 损失掩码，用于忽略padding位置
         
         # 根据当前步骤计算学习率（余弦退火调度）
@@ -142,6 +152,10 @@ def train_epoch(epoch, wandb):
 def init_model(lm_config):
     tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')
     model = MiniMindLM(lm_config).to(args.device)
+    # # 打印细粒度的模型参数
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"{name}: {param.numel()}")
     Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
 
